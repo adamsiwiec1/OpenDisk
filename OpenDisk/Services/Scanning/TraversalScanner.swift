@@ -11,9 +11,46 @@ enum TraversalScanner {
         min(8, max(4, ProcessInfo.processInfo.activeProcessorCount / 2))
     }
 
+    private final class ParentDirectory: Sendable {
+        static let maxRetained = 2_048
+        private static let retained = Mutex<Int>(0)
+
+        let fd: Int32
+
+        private init(fd: Int32) { self.fd = fd }
+
+        static func retain(_ fd: Int32) -> ParentDirectory? {
+            let admitted = retained.withLock { count in
+                guard count < maxRetained else { return false }
+                count += 1
+                return true
+            }
+            guard admitted else {
+                close(fd)
+                return nil
+            }
+            return ParentDirectory(fd: fd)
+        }
+
+        deinit {
+            close(fd)
+            Self.retained.withLock { $0 -= 1 }
+        }
+    }
+
     private struct WorkItem {
         let directoryID: FileTree.NodeID
         let path: String
+        var name: String = ""
+        var parent: ParentDirectory? = nil
+
+        func open() -> Int32 {
+            if let parent {
+                let fd = openat(parent.fd, name, BulkDirectoryReader.openFlags)
+                if fd >= 0 || (errno != EMFILE && errno != ENFILE) { return fd }
+            }
+            return Darwin.open(path, BulkDirectoryReader.openFlags)
+        }
     }
 
     private final class WorkState: Sendable {
@@ -129,12 +166,23 @@ enum TraversalScanner {
         while let item = state.pop() {
             if isCancelled() { continue }
 
-            let outcome = reader.read(
-                directoryAt: item.path, allowedDevices: allowedDevices
-            )
+            let fd = item.open()
+            guard fd >= 0 else {
+                metrics.addUnreadable()
+                continue
+            }
+            let outcome = reader.read(openDirectory: fd, allowedDevices: allowedDevices)
             guard case .contents(let contents, let device) = outcome else {
+                close(fd)
                 if case .unreadable = outcome { metrics.addUnreadable() }
                 continue
+            }
+            let parent: ParentDirectory?
+            if contents.subdirectoryNames.isEmpty {
+                close(fd)
+                parent = nil
+            } else {
+                parent = ParentDirectory.retain(fd)
             }
 
             var directoryBytes: Int64 = 0
@@ -176,7 +224,10 @@ enum TraversalScanner {
                         name: name, parent: item.directoryID,
                         size: 0, isDirectory: true
                     )
-                    discovered.append(WorkItem(directoryID: id, path: directoryPrefix + name))
+                    discovered.append(WorkItem(
+                        directoryID: id, path: directoryPrefix + name,
+                        name: name, parent: parent
+                    ))
                 }
                 for name in contents.mountPointNames {
                     tree.addNode(

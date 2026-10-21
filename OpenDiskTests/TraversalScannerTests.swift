@@ -134,4 +134,57 @@ struct TraversalScannerTests {
             }
         }
     }
+
+    @Test("scans more open parent directories than are kept open at once")
+    func wideTreeFallsBackToFullPaths() async throws {
+        try await withTemporaryTree { root in
+            let branches = 2_500
+            for branch in 0..<branches {
+                let leaf = root
+                    .appendingPathComponent("branch\(branch)", isDirectory: true)
+                    .appendingPathComponent("leaf", isDirectory: true)
+                try FileManager.default.createDirectory(at: leaf, withIntermediateDirectories: true)
+                try Data(count: 100).write(to: leaf.appendingPathComponent("f.bin"))
+            }
+
+            let metrics = ScanMetrics()
+            let tree = await TraversalScanner.scan(
+                path: root.path, rootName: root.path, workerCount: 8,
+                metrics: metrics, isCancelled: { false }
+            )
+
+            #expect(tree.nodeCount == 1 + branches * 3)
+            #expect(metrics.unreadableDirectories == 0)
+        }
+    }
+
+    @Test("an unreadable directory is skipped without stopping its siblings")
+    func unreadableDirectoryIsSkipped() async throws {
+        try await withTemporaryTree { root in
+            let locked = root.appendingPathComponent("locked", isDirectory: true)
+            let open = root.appendingPathComponent("open", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: locked.appendingPathComponent("inner", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.createDirectory(at: open, withIntermediateDirectories: true)
+            try Data(count: 100).write(to: open.appendingPathComponent("f.bin"))
+            try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+            defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path) }
+
+            let metrics = ScanMetrics()
+            let tree = await TraversalScanner.scan(
+                path: root.path, rootName: root.path,
+                metrics: metrics, isCancelled: { false }
+            )
+
+            #expect(tree.child(of: FileTree.rootID, named: "locked") != nil)
+            if let openNode = tree.child(of: FileTree.rootID, named: "open") {
+                #expect(tree.childCount(of: openNode) == 1)
+            } else {
+                Issue.record("open directory missing")
+            }
+            #expect(metrics.unreadableDirectories == 1)
+        }
+    }
 }

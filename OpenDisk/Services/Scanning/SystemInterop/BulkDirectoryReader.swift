@@ -33,11 +33,16 @@ final class BulkDirectoryReader {
         buffer.deallocate()
     }
 
+    static let openFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+
     func read(directoryAt path: String, allowedDevices: Set<dev_t>) -> DirectoryReadResult {
-        let fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        let fd = open(path, Self.openFlags)
         guard fd >= 0 else { return .unreadable }
         defer { close(fd) }
+        return read(openDirectory: fd, allowedDevices: allowedDevices)
+    }
 
+    func read(openDirectory fd: Int32, allowedDevices: Set<dev_t>) -> DirectoryReadResult {
         var info = stat()
         guard fstat(fd, &info) == 0 else { return .unreadable }
         guard allowedDevices.contains(info.st_dev) else { return .crossesDeviceBoundary }
